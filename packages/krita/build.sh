@@ -50,6 +50,8 @@ color_schemes=(/usr/share/color-schemes/Krita*)
   /usr/share/kritaplugins \
   "${color_schemes[@]}"
 
+printf '\nQT_QPA_PLATFORMTHEME=qt6ct\n' >> "$APPDIR/.env"
+
 ./quick-sharun.sh --make-appimage
 
 appimages=("$OUTPATH"/*.AppImage)
