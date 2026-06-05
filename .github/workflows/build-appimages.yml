@@ -1,0 +1,170 @@
+name: Build AppImages
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 4 * * *'
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build-appimages.yml'
+      - 'packages/**'
+      - 'scripts/**'
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: appimage-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: latest
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      packages: ${{ steps.packages.outputs.packages }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: packages
+        name: Discover packages
+        run: |
+          packages="$(scripts/list-packages.sh --json)"
+          echo "packages=$packages" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJSON(needs.prepare.outputs.packages) }}
+        platform:
+          - arch: x86_64
+            runner: ubuntu-latest
+            container: archlinux:latest
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+            container: menci/archlinuxarm:latest
+    runs-on: ${{ matrix.platform.runner }}
+    container:
+      image: ${{ matrix.platform.container }}
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install base dependencies
+        run: scripts/install-base-deps.sh
+
+      - name: Install package dependencies
+        run: scripts/install-package-deps.sh "${{ matrix.package }}"
+
+      - id: version
+        name: Detect package version
+        run: |
+          version="$(scripts/package-version.sh "${{ matrix.package }}")"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - id: cache-meta
+        name: Read cache metadata
+        run: |
+          revision="$(scripts/package-cache-revision.sh "${{ matrix.package }}")"
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+
+      - id: appimage-cache
+        name: Restore AppImage cache
+        uses: actions/cache/restore@v4
+        with:
+          path: dist/${{ matrix.package }}/${{ matrix.platform.arch }}
+          key: appimage-${{ matrix.package }}-${{ matrix.platform.arch }}-${{ steps.version.outputs.version }}-${{ steps.cache-meta.outputs.revision }}
+
+      - id: release-asset
+        name: Restore AppImage from rolling release
+        if: steps.appimage-cache.outputs.cache-hit != 'true'
+        run: |
+          if scripts/restore-release-assets.sh "${{ matrix.package }}" "${{ matrix.platform.arch }}" "${{ steps.version.outputs.version }}" "${{ env.RELEASE_TAG }}"; then
+            echo "restored=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "restored=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build package
+        if: steps.appimage-cache.outputs.cache-hit != 'true' && steps.release-asset.outputs.restored != 'true'
+        run: scripts/build-package.sh "${{ matrix.package }}" "${{ matrix.platform.arch }}"
+
+      - name: Write release metadata
+        run: |
+          output_dir="dist/${{ matrix.package }}/${{ matrix.platform.arch }}"
+          mkdir -p "$output_dir"
+          update_release=false
+          if [[ "${{ steps.appimage-cache.outputs.cache-hit }}" != 'true' && "${{ steps.release-asset.outputs.restored }}" != 'true' ]]; then
+            update_release=true
+          fi
+          {
+            echo 'PACKAGE=${{ matrix.package }}'
+            echo 'ARCH=${{ matrix.platform.arch }}'
+            echo 'VERSION=${{ steps.version.outputs.version }}'
+            echo "UPDATE_RELEASE=$update_release"
+          } > "$output_dir/release-meta-${{ matrix.package }}-${{ matrix.platform.arch }}.env"
+
+      - name: Validate package output
+        run: scripts/assert-package-output.sh "${{ matrix.package }}" "${{ matrix.platform.arch }}"
+
+      - name: Save AppImage cache
+        if: steps.appimage-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: dist/${{ matrix.package }}/${{ matrix.platform.arch }}
+          key: appimage-${{ matrix.package }}-${{ matrix.platform.arch }}-${{ steps.version.outputs.version }}-${{ steps.cache-meta.outputs.revision }}
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.package }}-${{ matrix.platform.arch }}
+          path: |
+            dist/${{ matrix.package }}/${{ matrix.platform.arch }}/*.AppImage
+            dist/${{ matrix.package }}/${{ matrix.platform.arch }}/*.zsync
+            dist/${{ matrix.package }}/${{ matrix.platform.arch }}/release-meta-*.env
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Show release assets
+        run: find release-assets -type f -print | sort
+
+      - name: Move rolling tag to this commit
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag -f "${{ env.RELEASE_TAG }}" "$GITHUB_SHA"
+          git push --force origin "refs/tags/${{ env.RELEASE_TAG }}"
+
+      - name: Delete non-rolling releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: scripts/delete-non-rolling-releases.sh "${{ env.RELEASE_TAG }}"
+
+      - name: Sync rolling release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TARGET: ${{ github.sha }}
+        run: scripts/sync-release-assets.sh "${{ env.RELEASE_TAG }}" release-assets
