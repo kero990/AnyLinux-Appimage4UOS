@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
 packages=(
   base-devel
   git
@@ -26,4 +28,5 @@ if command -v pacman-key >/dev/null 2>&1; then
   pacman-key --populate archlinuxarm || true
 fi
 
+"$repo_root/scripts/configure-pacman-ci.sh"
 pacman -Syu --noconfirm "${packages[@]}"

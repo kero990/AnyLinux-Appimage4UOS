@@ -11,6 +11,8 @@ if [[ ! -d "$package_dir" ]]; then
   exit 1
 fi
 
+"$repo_root/scripts/configure-pacman-ci.sh"
+
 if [[ -x "$install_script" ]]; then
   "$install_script"
 fi
